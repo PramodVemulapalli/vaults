@@ -225,6 +225,9 @@ contract Vault is ERC4626, Auth {
         bool trusted;
         // Used to determine profit and loss during harvests of the strategy.
         uint248 balance;
+        // The desired contribution of the strategy to the float incase of a withdrawal request
+        // A fixed point number where 1e18 represents 100% and 0 represents 0%.
+        uint256 strategyWithdrawalPercent;
     }
 
     /// @notice Maps strategies to data the Vault holds on them.
@@ -546,6 +549,29 @@ contract Vault is ERC4626, Auth {
 
         emit StrategyDistrusted(msg.sender, strategy);
     }
+    
+    /*///////////////////////////////////////////////////////////////
+                STRATEGY WITHDRAW PERCENT CONFIGURATION 
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Emitted when withdraw percentage is updated for a strategy
+    /// @param user The authorized user who trusted the strategy.
+    /// @param strategy The strategy that became trusted.
+    /// @param newStrategyWithdrawalPercent The strategy that became trusted.
+    event StrategyWithdrawalPercentUpdated(address indexed user, Strategy indexed strategy, uint256 newStrategyWithdrawalPercent);
+
+    /// @notice Stores a strategy as trusted, enabling it to be harvested.
+    /// @param strategy The strategy to make trusted.
+    function setStrategyWithdrawalPercent(Strategy strategy, uint256 newStrategyWithdrawalPercent) external requiresAuth {
+
+        // A target float percentage over 100% doesn't make sense.
+        require(newStrategyWithdrawalPercent <= 1e18, "TARGET_TOO_HIGH");
+
+        // Store the strategy as trusted.
+        getStrategyData[strategy].strategyWithdrawalPercent = newStrategyWithdrawalPercent;
+
+        emit StrategyWithdrawalPercentUpdated(msg.sender, strategy, newStrategyWithdrawalPercent);
+    }
 
     /*///////////////////////////////////////////////////////////////
                          WITHDRAWAL STACK LOGIC
@@ -608,15 +634,19 @@ contract Vault is ERC4626, Auth {
     /// @param underlyingAmount The amount of underlying tokens to pull into float.
     /// @dev Automatically removes depleted strategies from the withdrawal stack.
     function pullFromWithdrawalStack(uint256 underlyingAmount) internal {
+    
         // We will update this variable as we pull from strategies.
         uint256 amountLeftToPull = underlyingAmount;
 
         // We'll start at the tip of the stack and traverse backwards.
         uint256 currentIndex = withdrawalStack.length - 1;
+        
+        uint256 shareOfTotalToPull = 0;
 
         // Iterate in reverse so we pull from the stack in a "last in, first out" manner.
         // Will revert due to underflow if we empty the stack before pulling the desired amount.
         for (; ; currentIndex--) {
+        
             // Get the strategy at the current stack index.
             Strategy strategy = withdrawalStack[currentIndex];
 
@@ -625,6 +655,7 @@ contract Vault is ERC4626, Auth {
 
             // If the strategy is currently untrusted or was already depleted:
             if (!getStrategyData[strategy].trusted || strategyBalance == 0) {
+            
                 // Remove it from the stack.
                 withdrawalStack.pop();
 
@@ -634,8 +665,20 @@ contract Vault is ERC4626, Auth {
                 continue;
             }
 
+            // Find the appropriate amount to pull from the strategy 
+            shareOfTotalToPull = underlyingAmount.mulWadDown(getStrategyData[strategy].strategyWithdrawalPercent);
+            
+            // Ensure that you are not pulling more than what is needed for withdrawal and mainitaining float 
+            shareOfTotalToPull = shareOfTotalToPull < amountLeftToPull ?  shareOfTotalToPull : amountLeftToPull;
+            
+            // If you are not pulling anythingthat 
+            if ( shareOfTotalToPull == 0 ) {
+                // Move onto the next strategy.
+                continue;
+            }
+                
             // We want to pull as much as we can from the strategy, but no more than we need.
-            uint256 amountToPull = strategyBalance > amountLeftToPull ? amountLeftToPull : strategyBalance;
+            uint256 amountToPull = strategyBalance > shareOfTotalToPull ? shareOfTotalToPull : strategyBalance;
 
             unchecked {
                 // Compute the balance of the strategy that will remain after we withdraw.
@@ -655,7 +698,7 @@ contract Vault is ERC4626, Auth {
                 require(strategy.redeemUnderlying(amountToPull) == 0, "REDEEM_FAILED");
 
                 // If we fully depleted the strategy:
-                if (strategyBalanceAfterWithdrawal == 0) {
+                if ( strategyBalanceAfterWithdrawal == 0 ) {
                     // Remove it from the stack.
                     withdrawalStack.pop();
 
